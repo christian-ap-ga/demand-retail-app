@@ -1,0 +1,622 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploys a SageMaker Studio domain for 1C-Company data product architecture.
+  Provisions a JupyterLab space, a serverless MLflow tracking server, an EFS cleanup
+  Lambda, and all required IAM roles and networking resources.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETERS
+# All values can be overridden at deploy time. Defaults are set for the course.
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  DomainName:
+    Type: String
+    Description: Unique name for the SageMaker Studio domain within the AWS region.
+    Default: 1c-company-sagemaker-domain-2026
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      VPC where the domain security group will be created.
+      Must be the same VPC as the provided subnets.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      One or more subnets for the domain. SageMaker uses these when launching
+      JupyterLab app containers.
+
+  AuthMode:
+    Type: String
+    Description: >
+      Authentication mode for the domain. Use IAM for simple single-account
+      setups (course default). Use SSO for enterprise multi-user environments.
+      Cannot be changed after the domain is created.
+    Default: IAM
+    AllowedValues:
+      - IAM
+      - SSO
+
+  DefaultUserProfileName:
+    Type: String
+    Description: Name of the default user profile created inside the domain.
+    Default: datascientist
+
+  ExecutionRoleName:
+    Type: String
+    Description: >
+      Name for the IAM role assigned to the domain and user profile.
+      This role is used by Studio, training jobs, and processing jobs.
+    Default: 1C_SageMakerStudioExecutionRole2026
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOURCES
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # EFS AUTO-CLEANUP
+  #
+  # Problem: when a SageMaker domain is deleted, AWS intentionally keeps the
+  # associated EFS file system alive to prevent accidental data loss.
+  # CloudFormation has no native property to override this behavior, so orphaned
+  # EFS volumes accumulate and incur cost (~$0.30/GB/month).
+  #
+  # Solution: two Custom Resources + SSM Parameter Store as a bridge.
+  #
+  # Lifecycle flow:
+  #   CREATE  EfsCleanupResource → Domain → EfsIdStoreResource (SSM write)
+  #                                       → UserProfile → Space
+  #   DELETE  Space → UserProfile → EfsIdStoreResource → Domain
+  #                                                     → EfsCleanupResource (SSM read + EFS delete)
+  #
+  # The domain has DependsOn: EfsCleanupResource, so CloudFormation always
+  # deletes the domain before the cleanup Lambda runs. At that point the EFS
+  # is fully orphaned and safe to delete.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  # IAM role that allows the lifecycle Lambda to write/read SSM parameters
+  # and delete EFS resources. CloudWatch Logs access is provided by the
+  # AWSLambdaBasicExecutionRole managed policy.
+  EfsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EfsLifecyclePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # SSM access is scoped to the /sagemaker-cleanup/ namespace only.
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sagemaker-cleanup/*'
+              # EFS permissions are broad because the file system ID is only
+              # known at runtime (retrieved from SSM).
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:DescribeMountTargets
+                  - elasticfilesystem:DeleteMountTarget
+                  - elasticfilesystem:DeleteFileSystem
+                Resource: '*'
+
+  # Single Lambda function that handles both Custom Resource actions:
+  #   Action=Store  → called after domain creation; persists EFS ID to SSM.
+  #   Action=Cleanup → called after domain deletion; reads EFS ID from SSM
+  #                    and deletes mount targets + file system.
+  # Timeout is 300s to allow time for mount target deletion polling.
+  EfsLifecycleLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt EfsLambdaRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              action      = event['ResourceProperties']['Action']
+              domain_name = event['ResourceProperties']['DomainName']
+              ssm_key     = f"/sagemaker-cleanup/{domain_name}/efs-id"
+              ssm         = boto3.client('ssm')
+
+              try:
+                  # ── Store: capture EFS ID into SSM right after domain creation ──
+                  if action == 'Store' and event['RequestType'] == 'Create':
+                      efs_id = event['ResourceProperties']['EfsId']
+                      ssm.put_parameter(Name=ssm_key, Value=efs_id,
+                                        Type='String', Overwrite=True)
+                      logger.info(f"Stored EFS ID {efs_id} → {ssm_key}")
+
+                  # ── Cleanup: delete EFS after domain has been destroyed ──
+                  elif action == 'Cleanup' and event['RequestType'] == 'Delete':
+                      efs_id = ssm.get_parameter(Name=ssm_key)['Parameter']['Value']
+                      logger.info(f"Cleaning up EFS {efs_id}")
+                      efs = boto3.client('efs')
+
+                      # Delete VPC mount targets (required before file system deletion)
+                      mount_targets = efs.describe_mount_targets(
+                          FileSystemId=efs_id)['MountTargets']
+                      for mt in mount_targets:
+                          efs.delete_mount_target(MountTargetId=mt['MountTargetId'])
+                          logger.info(f"Deleted mount target {mt['MountTargetId']}")
+
+                      # Wait for mount targets to finish deleting (up to 2 min)
+                      for _ in range(24):
+                          time.sleep(5)
+                          remaining = efs.describe_mount_targets(
+                              FileSystemId=efs_id)['MountTargets']
+                          if not remaining:
+                              break
+                          logger.info(f"Waiting for {len(remaining)} mount target(s)...")
+
+                      # Delete the file system
+                      efs.delete_file_system(FileSystemId=efs_id)
+                      logger.info(f"EFS {efs_id} deleted successfully")
+
+                      # Remove the SSM parameter
+                      ssm.delete_parameter(Name=ssm_key)
+
+              except Exception as e:
+                  # Always return SUCCESS so stack deletion is never blocked.
+                  # Errors are logged to CloudWatch for debugging.
+                  logger.error(f"Error in {action} handler: {e}")
+
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  # Custom Resource 1 (Cleanup)
+  # Created BEFORE the domain (domain has DependsOn: EfsCleanupResource).
+  # Deleted AFTER the domain. Its DELETE handler reads the EFS ID from SSM
+  # and performs the full EFS teardown.
+  EfsCleanupResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt EfsLifecycleLambda.Arn
+      Action: Cleanup
+      DomainName: !Ref DomainName
+
+  # Custom Resource 2 (Store)
+  # Created AFTER the domain (implicit dependency via !GetAtt HomeEfsFileSystemId).
+  # Deleted BEFORE the domain. Its CREATE handler writes the EFS ID to SSM.
+  # Its DELETE handler is a no-op; the ID is already in SSM for the Cleanup Lambda.
+  EfsIdStoreResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt EfsLifecycleLambda.Arn
+      Action: Store
+      DomainName: !Ref DomainName
+      EfsId: !GetAtt SageMakerStudioDomain.HomeEfsFileSystemId
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # IAM — SAGEMAKER EXECUTION ROLE
+  #
+  # Broad permissions are intentional for a course environment where students
+  # need access to a wide set of AWS services. For production, scope each
+  # policy to specific resources and actions.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref ExecutionRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess       # Studio, training, inference
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess               # Data and model artifact access
+        - arn:aws:iam::aws:policy/ComprehendFullAccess             # NLP demos
+        - arn:aws:iam::aws:policy/AmazonRekognitionFullAccess      # Vision demos
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess          # Foundation model inference
+        - arn:aws:iam::aws:policy/BedrockAgentCoreFullAccess       # AgentCore runtimes and memory
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess  # Push/pull Docker images
+      Policies:
+        # MLflow uses a distinct IAM service prefix (sagemaker-mlflow:*) that is
+        # NOT included in AmazonSageMakerFullAccess. Without these permissions,
+        # mlflow.set_tracking_uri() calls from notebooks will return auth errors.
+        - PolicyName: MlflowAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sagemaker-mlflow:*
+                Resource: '*'
+        # RDS access for chapter 10: Secrets Manager to retrieve credentials, and
+        # RDS describe permission so notebooks can look up the endpoint at runtime.
+        # The actual TCP connection to port 5432 is controlled at the network layer
+        # by the RDS security group (not by IAM), so no rds-db:connect is required.
+        - PolicyName: RdsAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Retrieve the RDS master password stored in Secrets Manager.
+              # Scoped to the /itam/rds/ namespace created by rds-postgresql-cfn.yaml.
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:itam/rds/*'
+              # Read-only RDS metadata — allows notebooks to describe instances
+              # and look up the endpoint without hard-coding it.
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                Resource: '*'
+        # CloudWatch Logs read access — needed to tail ECS task logs from the terminal
+        - PolicyName: CloudWatchLogsReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:StartLiveTail
+                Resource: '*'
+        # ECS Express Mode — needed to deploy and manage Express Gateway services
+        # from the SageMaker terminal (demo 11)
+        - PolicyName: ECSExpressModePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:CreateExpressGatewayService
+                  - ecs:UpdateExpressGatewayService
+                  - ecs:DeleteExpressGatewayService
+                  - ecs:DescribeExpressGatewayService
+                  - ecs:CreateCluster
+                  - ecs:DescribeClusters
+                  - ecs:DeleteCluster
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:CreateService
+                  - ecs:UpdateService
+                  - ecs:DeleteService
+                  - ecs:DescribeServices
+                  - ecs:ListClusters
+                  - ecs:ListServices
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                  - ecs:DescribeServiceDeployments
+                  - ecs:ListServiceDeployments
+                  - ecs:DescribeTaskDefinition
+                  - ecs:TagResource
+                Resource: '*'
+        # CloudFormation access — needed to deploy stacks from the SageMaker terminal
+        # (e.g. ecs-express-roles.yaml) and to read stack Outputs from notebooks.
+        - PolicyName: CloudFormationDeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Deploy and manage stacks
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ListStacks
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+              # IAM permissions needed when deploying stacks with CAPABILITY_NAMED_IAM
+              # (e.g. ecs-express-roles.yaml creates IAM roles)
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:UpdateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:CreateServiceLinkedRole
+                Resource: '*'
+        # Glue + Athena access for awswrangler (wr.s3.to_parquet, wr.athena.read_sql_query).
+        # awswrangler in distributed/Ray mode reads credentials from the execution role
+        # directly and does not support boto3_session, so permissions must be on the role.
+        - PolicyName: GlueAthenaDataEngineeringPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Glue Data Catalog — needed to create/update/delete tables and databases
+              # when awswrangler registers Parquet files written to S3.
+              - Effect: Allow
+                Action:
+                  - glue:CreateDatabase
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:CreateTable
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:BatchDeleteTable
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchCreatePartition
+                  - glue:BatchDeletePartition
+                Resource: '*'
+              # Athena — needed for wr.athena.read_sql_query and CTAS queries.
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                  - athena:ListWorkGroups
+                Resource: '*'
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # NETWORKING — SECURITY GROUP
+  #
+  # Attached to the domain and user profile. No inbound rules are defined
+  # (PublicInternetOnly mode does not require them). All outbound traffic is
+  # allowed so Studio apps can reach the internet and AWS service endpoints.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  SageMakerStudioSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for SageMaker Studio Domain
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # SAGEMAKER STUDIO DOMAIN
+  #
+  # AppNetworkAccessType: PublicInternetOnly — app traffic goes through an
+  # AWS-managed VPC with internet access. Simpler for course demos; use
+  # VpcOnly for production environments.
+  #
+  # DockerSettings.EnableDockerAccess: ENABLED — allows users to build and
+  # run Docker containers from JupyterLab (local mode). Domain-wide setting;
+  # cannot be scoped to individual user profiles.
+  #
+  # DependsOn: EfsCleanupResource — ensures the cleanup Lambda is the last
+  # resource deleted, after the domain (and its EFS) are already gone.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  SageMakerStudioDomain:
+    Type: AWS::SageMaker::Domain
+    DependsOn: EfsCleanupResource
+    Properties:
+      DomainName: !Ref DomainName
+      AuthMode: !Ref AuthMode
+      VpcId: !Ref VpcId
+      SubnetIds: !Ref SubnetIds
+      AppNetworkAccessType: PublicInternetOnly
+      DomainSettings:
+        DockerSettings:
+          EnableDockerAccess: ENABLED
+      DefaultUserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        SecurityGroups:
+          - !Ref SageMakerStudioSecurityGroup
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # USER PROFILE
+  #
+  # AutoMountHomeEFS: DefaultAsDomain — inherits the domain setting (Enabled).
+  # Each user gets a private /home directory on the shared EFS volume.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  DefaultUserProfile:
+    Type: AWS::SageMaker::UserProfile
+    Properties:
+      DomainId: !Ref SageMakerStudioDomain
+      UserProfileName: !Ref DefaultUserProfileName
+      UserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        SecurityGroups:
+          - !Ref SageMakerStudioSecurityGroup
+        AutoMountHomeEFS: DefaultAsDomain
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JUPYTERLAB SPACE
+  #
+  # A private JupyterLab space named "1c-company" owned by the datascientist
+  # user profile. Uses the latest SageMaker Distribution CPU image (Python 3.12)
+  # on an ml.t3.medium instance (2 vCPU, 4 GB RAM) — sufficient for course demos.
+  #
+  # SageMakerImageArn points to the AWS-managed distribution image in account
+  # 885854791233. No version is pinned so the space always uses the latest
+  # supported release.
+  #
+  # EBS volume (5 GB) covers basic course workloads. Increase for larger datasets.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  ArquitecturaSpace:
+    Type: AWS::SageMaker::Space
+    DependsOn: DefaultUserProfile
+    Properties:
+      DomainId: !Ref SageMakerStudioDomain
+      SpaceName: 1c-company
+      OwnershipSettings:
+        OwnerUserProfileName: !Ref DefaultUserProfileName
+      SpaceSharingSettings:
+        SharingType: Private
+      SpaceSettings:
+        AppType: JupyterLab
+        JupyterLabAppSettings:
+          DefaultResourceSpec:
+            SageMakerImageArn: arn:aws:sagemaker:us-east-1:885854791233:image/sagemaker-distribution-cpu
+            InstanceType: ml.t3.medium
+        SpaceStorageSettings:
+          EbsStorageSettings:
+            EbsVolumeSizeInGb: 5
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # MLFLOW TRACKING SERVER (SERVERLESS)
+  #
+  # AWS-managed MLflow server. No infrastructure to provision or maintain.
+  # Experiments, runs, parameters, and metrics are stored in the tracking
+  # server backend. Artifacts (models, datasets, plots) land in S3.
+  #
+  # TrackingServerSize: Small — supports up to 25 concurrent users.
+  # AutomaticModelRegistration: false — students register models manually
+  # to understand the workflow.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  # S3 bucket for MLflow artifact storage.
+  # DeletionPolicy: Retain — CloudFormation cannot delete a non-empty bucket.
+  # After deleting the stack, empty and delete this bucket manually:
+  #   aws s3 rm s3://<bucket-name> --recursive
+  #   aws s3 rb s3://<bucket-name>
+  MlflowArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '1c-mlflow-artifacts-${AWS::AccountId}'
+
+  # Dedicated IAM role for the MLflow tracking server (least-privilege).
+  # S3 permissions are scoped to the artifact bucket only.
+  # SageMaker permissions cover automatic model registration in the Model Registry.
+  MlflowTrackingServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MlflowArtifactStorePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt MlflowArtifactBucket.Arn
+                  - !Sub '${MlflowArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - sagemaker:AddTags
+                  - sagemaker:CreateModelPackageGroup
+                  - sagemaker:CreateModelPackage
+                  - sagemaker:UpdateModelPackage
+                  - sagemaker:DescribeModelPackageGroup
+                Resource: '*'
+
+  MlflowTrackingServer:
+    Type: AWS::SageMaker::MlflowTrackingServer
+    Properties:
+      TrackingServerName: !Sub '${DomainName}-mlflow'
+      ArtifactStoreUri: !Sub 's3://${MlflowArtifactBucket}/mlflow-artifacts'
+      RoleArn: !GetAtt MlflowTrackingServerRole.Arn
+      TrackingServerSize: Small
+      AutomaticModelRegistration: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUTS
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+
+  # ── SageMaker Studio Domain ──────────────────────────────────────────────
+  DomainId:
+    Description: ID of the SageMaker Studio domain.
+    Value: !Ref SageMakerStudioDomain
+
+  DomainUrl:
+    Description: AWS Console URL for SageMaker Studio.
+    Value: !Sub 'https://console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/studio/onboard/setup'
+
+  HomeEfsFileSystemId:
+    Description: >
+      EFS file system ID created by the domain for user home directories.
+      Automatically deleted on stack teardown by the EfsCleanupResource Lambda.
+    Value: !GetAtt SageMakerStudioDomain.HomeEfsFileSystemId
+
+  # ── User Profile ─────────────────────────────────────────────────────────
+  DefaultUserProfileId:
+    Description: ID of the default user profile inside the domain.
+    Value: !Ref DefaultUserProfile
+
+  # ── IAM Roles ─────────────────────────────────────────────────────────────
+  ExecutionRoleArn:
+    Description: >
+      ARN of the SageMaker execution role. Used by Studio, training jobs,
+      and processing jobs. Reference this ARN when launching jobs via SDK or CLI.
+    Value: !GetAtt SageMakerExecutionRole.Arn
+
+  MlflowTrackingServerRoleArn:
+    Description: ARN of the dedicated IAM role for the MLflow tracking server.
+    Value: !GetAtt MlflowTrackingServerRole.Arn
+
+  # ── MLflow Tracking Server ────────────────────────────────────────────────
+  MlflowTrackingServerArn:
+    Description: ARN of the MLflow tracking server.
+    Value: !GetAtt MlflowTrackingServer.TrackingServerArn
+
+  MlflowConsoleUrl:
+    Description: >
+      AWS Console URL for the MLflow tracking server.
+      NOTE: the tracking URI used in mlflow.set_tracking_uri() contains a
+      generated hash and is not available from CloudFormation. Retrieve it
+      after deployment with:
+        aws sagemaker describe-mlflow-tracking-server \
+          --tracking-server-name <name> --query TrackingServerUrl --output text
+    Value: !Sub 'https://console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/mlflow-tracking-servers/${DomainName}-mlflow'
+
+  # ── S3 ────────────────────────────────────────────────────────────────────
+  MlflowArtifactBucketName:
+    Description: >
+      Name of the S3 bucket used for MLflow artifact storage.
+      This bucket is retained on stack deletion — empty and delete it manually.
+    Value: !Ref MlflowArtifactBucket
+
+  MlflowArtifactBucketArn:
+    Description: ARN of the MLflow artifact S3 bucket.
+    Value: !GetAtt MlflowArtifactBucket.Arn
