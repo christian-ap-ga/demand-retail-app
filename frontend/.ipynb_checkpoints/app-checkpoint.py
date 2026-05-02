@@ -1,4 +1,5 @@
-# ── Dependencias ────────────────────────────────────────────────────────────
+# Dependencias 
+# ---------------------------------------------------------------------------
 import io
 import sys
 import os
@@ -21,9 +22,10 @@ from backend.inference import (
     export_predictions,
 )
 
-# ── Configuración de página ───────────────────────────────────────────────────
+# Configuración de la página
+# ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="1C Company · Forecast",
+    page_title="1C Company - Forecast",
     layout="wide",
 )
 
@@ -114,7 +116,8 @@ hr {
 </style>
 """, unsafe_allow_html=True)
 
-# ── Sidebar: filtros globales ─────────────────────────────────────────────────
+# Sidebar: filtros globales
+# ---------------------------------------------------------------------------
 with st.sidebar:
     st.title("Configuration")
     st.divider()
@@ -156,7 +159,8 @@ st.session_state["filters"] = {
     "categories": selected_categories or None,
 }
 
-# ── Cargar datos filtrados (compartido entre Tab 1 y Tab 3) ───────────────────
+# Cargar datos filtrados 
+# ---------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def load_predictions(regions, shops, categories):
     return get_predictions(
@@ -172,7 +176,8 @@ df_pred = load_predictions(
     tuple(f["categories"]) if f["categories"] else None,
 )
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
+# Tabs 
+# ---------------------------------------------------------------------------
 st.title("1C Company — Forecast App")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -184,8 +189,8 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 
-# TAB 1 - Forecasts
-# ─────────────────────────────────────────────────────────────────────────────
+# Tab 1 - Forecasts
+# ---------------------------------------------------------------------------
 with tab1:
     st.header("Demand Forecast")
 
@@ -204,7 +209,7 @@ with tab1:
 
         st.divider()
 
-        # ── Time Series: histórico + forecast + intervalo de confianza ────────
+        # Time Series: histórico + forecast + intervalo de confianza
         df_ts = (
             df_pred
             .groupby("date")
@@ -218,7 +223,7 @@ with tab1:
 
         fig_ts = go.Figure()
 
-        # Banda de confianza (ribbon)
+        # Banda de confianza
         fig_ts.add_trace(go.Scatter(
             x=pd.concat([df_ts["date"], df_ts["date"][::-1]]),
             y=pd.concat([df_ts["value_upper"], df_ts["value_lower"][::-1]]),
@@ -251,7 +256,7 @@ with tab1:
 
         st.plotly_chart(fig_ts, use_container_width=True)
 
-        # ── Bar chart: unidades por categoría ────────────────────────────────
+        # Bar chart: unidades por categoría
         df_cat = (
             df_pred
             .groupby("category_id")["value"]
@@ -277,8 +282,8 @@ with tab1:
         st.subheader("Detailed Forecasts")
         st.dataframe(df_pred, use_container_width=True, hide_index=True)
 
-# TAB 2 - Model Evaluation
-# ─────────────────────────────────────────────────────────────────────────────
+# Tab 2 - Model Evaluation
+# ---------------------------------------------------------------------------
 with tab2:
     st.header("Model Performance")
 
@@ -328,8 +333,8 @@ with tab2:
             )
 
 
-# TAB 3 - Export
-# ─────────────────────────────────────────────────────────────────────────────
+# Tab 3 - Export
+# ---------------------------------------------------------------------------
 with tab3:
     st.header("Export Forecasts")
 
@@ -351,7 +356,7 @@ with tab3:
         st.metric("Rows to export", f"{len(df_pred):,}")
         st.divider()
 
-        # ── Formato de exportación ────────────────────────────────────────────
+        # Formato de exportación
         fmt = st.radio(
             "Export format",
             ["CSV (.csv)", "Parquet (.parquet)"],
@@ -376,7 +381,7 @@ with tab3:
 
         st.divider()
 
-        # ── Preview con Great Tables ──────────────────────────────────────────
+        # Preview con Great Tables
         from great_tables import GT, style, loc
 
         st.subheader("Preview (first 50 rows)")
@@ -438,8 +443,8 @@ with tab3:
             scrolling=True,
         )
 
-# TAB 4 - Feedback
-# ─────────────────────────────────────────────────────────────────────────────
+# Tab 4 - Feedback
+# ---------------------------------------------------------------------------
 with tab4:
     st.header("Feedback")
 
@@ -489,8 +494,8 @@ with tab4:
                 else:
                     st.error("Error submitting feedback. Please try again.")
 
-# TAB 5 - System Health
-# ─────────────────────────────────────────────────────────────────────────────
+# Tab 5 - System Health
+# ---------------------------------------------------------------------------
 with tab5:
     st.header("System Health")
 

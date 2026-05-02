@@ -1,17 +1,20 @@
-# ── Dependencias ────────────────────────────────────────────────────────────
+# Dependencias 
+# ---------------------------------------------------------------------------
 import json
 import io
 import boto3
 import pandas as pd
 from sqlalchemy import create_engine, text
 
-# ── Parámetros ───────────────────────────────────────────────────────────────
+# Parámetros 
+# ---------------------------------------------------------------------------
 SECRET_ID    = "x"
 RDS_REPLICA  = "x"
 REGION       = "us-east-1"
 
 
-# ── Crear Engine ─────────────────────────────────────────────────────────────
+# Crear Engine
+# ---------------------------------------------------------------------------
 def build_engine():
     # Obtener credenciales desde SecretsManager
     client = boto3.client("secretsmanager", region_name=REGION)
@@ -27,11 +30,15 @@ def build_engine():
 
     return engine
 
-# ── Verificar conexión ───────────────────────────────────────────────────────
+# Verificar conexión
+# ---------------------------------------------------------------------------
 engine = build_engine()
 with engine.connect() as conn:
     conn.execute(text("SELECT 1"))
 
+
+# Llamadas
+# ---------------------------------------------------------------------------
 def get_filter_options():
     """Retorna las opciones únicas para los filtros de Tab 1"""
     SQL = """

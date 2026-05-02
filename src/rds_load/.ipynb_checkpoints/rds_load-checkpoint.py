@@ -1,7 +1,7 @@
 """
 rds_load.py — ETL RDS Layer: carga de datos a PostgreSQL vía SQLAlchemy 2.0.
 
-Este script forma parte del pipeline de demanda retail. Su responsabilidad es 
+Este script forma parte del pipeline para 1C Company. Su responsabilidad es 
 insertar los datos desde archivos parquet en S3 hacia una base de datos 
 PostgreSQL en Amazon RDS, respetando el orden de dependencias FK definido 
 en el modelo de datos:
@@ -19,15 +19,10 @@ Las credenciales de RDS se obtienen exclusivamente desde AWS Secrets Manager.
 El endpoint RDS y credenciales se definen en constantes de configuración.
 
 Uso:
-    python src/rds_load/rds_load.py
-
-Las constantes de configuración deben actualizarse en el módulo:
-    - S3_BUCKET: nombre del bucket S3
-    - S3_PATHS: diccionario con rutas de archivos parquet
-    - SECRET_ID: ARN o nombre del secreto en Secrets Manager
-    - RDS_ENDPOINT: host del endpoint primario de RDS
-    - REGION: región AWS
+    uv run python src/rds_load/rds_load.py
 """
+# Dependencias 
+# ---------------------------------------------------------------------------
 
 import argparse
 import json
@@ -241,7 +236,7 @@ def main(
     logger: logging.Logger,
 ) -> None:
     """
-    Orquesta el pipeline: S3 a RDS.
+    Orquesta el pipeline: S3 a RDS
     """
     # 1. Credenciales RDS
     creds = get_secret(secret_id, region, logger)
@@ -317,7 +312,7 @@ def main(
 
 if __name__ == "__main__":
     _logger = setup_logging()
-    _logger.info("Iniciando pipeline S3 a RDS.")
+    _logger.info("Iniciando pipeline S3 a RDS")
 
     main(
         secret_id=SECRET_ID,
@@ -326,3 +321,4 @@ if __name__ == "__main__":
         region=REGION,
         logger=_logger,
     )
+    _logger.info("Proceso finalizado correctamente")
