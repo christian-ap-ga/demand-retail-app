@@ -8,7 +8,6 @@ dependencies = [
     "awswrangler>=3.16.0",
     "boto3>=1.42.97",
     "great-tables>=0.21.0",
-    "ipykernel>=7.2.0",
     "matplotlib>=3.10.9",
     "numpy>=2.4.4",
     "pandas>=3.0.2",
