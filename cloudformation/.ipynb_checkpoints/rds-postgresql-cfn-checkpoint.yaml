@@ -25,12 +25,12 @@ Parameters:
   DBName:
     Type: String
     Description: Name of the initial database to create inside the RDS instance.
-    Default: company1cdb
+    Default: c
 
   DBUsername:
     Type: String
     Description: Master username for the PostgreSQL instance.
-    Default: prod_admin
+    Default: prod-1c
     NoEcho: false
 
   DBPassword:
@@ -158,7 +158,7 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      DBInstanceIdentifier: !Sub 'company-1c-${AWS::AccountId}'
+      DBInstanceIdentifier: !Sub '1ccompany-${AWS::AccountId}'
       DBInstanceClass: db.t3.micro
       Engine: postgres
       EngineVersion: '17.4'
@@ -197,7 +197,7 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      DBInstanceIdentifier: !Sub 'company-1c-replica-${AWS::AccountId}'
+      DBInstanceIdentifier: !Sub '1ccompany-replica-${AWS::AccountId}'
       DBInstanceClass: db.t3.micro
       SourceDBInstanceIdentifier: !Ref RdsInstance
       PubliclyAccessible: true
