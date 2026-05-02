@@ -98,6 +98,17 @@ def load_gold():
     # Predictions
     s3.upload_file('data/gold/predictions.csv', bucket_name, 'gold/predictions/predictions.csv')
 
+# Crear carpetas adicionales
+# ---------------------------------------------------------------------------
+
+def create_folders():
+    """
+    Crea las carpetas adicionales para feedback, eventos y evaluacion del modelo
+    """
+    s3.put_object(Bucket=bucket_name, Key='gold/feedback/')
+    s3.put_object(Bucket=bucket_name, Key='gold/model_evaluation/')
+    s3.put_object(Bucket=bucket_name, Key='gold/system/')
+
 # Orquestador principal
 # ---------------------------------------------------------------------------
 def main(logger: logging.Logger):
@@ -110,6 +121,8 @@ def main(logger: logging.Logger):
     logger.info("Archivos insertados correctamente en S3 - silver")
     load_gold()
     logger.info("Archivos insertados correctamente en S3 - gold")
+    create_folders()
+    logger.info("Carpetas adicionales creadas correctamente en S3")
 
 # Entry point
 # ---------------------------------------------------------------------------
