@@ -1,6 +1,6 @@
 <mxfile host="app.diagrams.net">
   <diagram id="Pn2uagJREX6Z1DN-F_NW" name="Página-1">
-    <mxGraphModel dx="2293" dy="1103" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2800" pageHeight="2000" math="0" shadow="0">
+    <mxGraphModel dx="917" dy="441" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2800" pageHeight="2000" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
@@ -92,7 +92,7 @@
         <mxCell id="s3_silver" parent="1" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.s3;fillColor=#7AA116;strokeColor=none;" value="" vertex="1">
           <mxGeometry height="50" width="50" x="490" y="297" as="geometry" />
         </mxCell>
-        <mxCell id="s3_silver_lbl" parent="1" style="text;html=1;align=left;fontSize=10;verticalAlign=top;" value="s3://bucket/silver/&#xa;• augmented_sales_cleaned/&#xa;• monthly_sales/ ← train input&#xa;• items_features/&#xa;• categories_features/&#xa;• shops_features/" vertex="1">
+        <mxCell id="s3_silver_lbl" parent="1" style="text;html=1;align=left;fontSize=10;verticalAlign=top;" value="s3://bucket/silver/&lt;br&gt;• sales_prep/&lt;br&gt;• monthly_sales/ ← train input&lt;br&gt;• items_features/&lt;br&gt;• categories_features/&lt;br&gt;• shops_features/" vertex="1">
           <mxGeometry height="100" width="230" x="550" y="293" as="geometry" />
         </mxCell>
         <mxCell id="s3_gold_hdr" parent="1" style="text;html=1;fontStyle=1;fontSize=12;fillColor=#ffd700;strokeColor=#d6b656;rounded=1;" value="&amp;nbsp;GOLD — Inference, Artifacts &amp;amp; Exports" vertex="1">
@@ -101,7 +101,7 @@
         <mxCell id="s3_gold" parent="1" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.s3;fillColor=#7AA116;strokeColor=none;" value="" vertex="1">
           <mxGeometry height="50" width="50" x="490" y="472" as="geometry" />
         </mxCell>
-        <mxCell id="s3_gold_lbl" parent="1" style="text;html=1;align=left;fontSize=10;verticalAlign=top;" value="s3://bucket/gold/&#xa;• inference/items_fe/&#xa;• inference/categories_fe/&#xa;• inference/shops_fe/&#xa;• inference/last_hist_data/&#xa;• artifacts/model.joblib&#xa;• predictions/predictions.csv  ← serve writes here&#xa;• exports/ ← Tab 3 downloads" vertex="1">
+        <mxCell id="s3_gold_lbl" parent="1" style="text;html=1;align=left;fontSize=10;verticalAlign=top;" value="s3://bucket/gold/&lt;br&gt;• inference/items_fe/&lt;br&gt;• inference/categories_fe/&lt;br&gt;• inference/shops_fe/&lt;br&gt;• inference/last_hist_data/&lt;br&gt;• artifacts/xgb_monthly_forecast_model.joblib&lt;br&gt;• predictions/predictions.csv  ← serve writes&lt;br&gt;• exports/ ← Tab 3 downloads" vertex="1">
           <mxGeometry height="130" width="260" x="550" y="468" as="geometry" />
         </mxCell>
         <mxCell id="lambda_loader" parent="1" style="shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;fillColor=#E7157B;strokeColor=none;" value="" vertex="1">
