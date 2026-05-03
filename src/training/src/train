@@ -1,0 +1,170 @@
+#!/usr/bin/env python
+"""
+Entrenamiento XGBoost para SageMaker BYOC.
+Lee datos de /opt/ml/input/data/training/
+Escribe modelo en /opt/ml/model/
+"""
+
+import json
+import os
+import sys
+import time
+import traceback
+
+import joblib
+import numpy as np
+import pandas as pd
+import polars as pl
+import xgboost as xgb
+from category_encoders.target_encoder import TargetEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import mean_absolute_error, median_absolute_error, r2_score, root_mean_squared_error
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+
+from utils.features import CAT_COLS, HIGH_CARD_COLS, NUM_COLS
+
+# ── Paths de SageMaker ──────────────────────────────────────────────────────
+prefix      = "/opt/ml/"
+INPUT_PATH  = os.path.join(prefix, "input/data/training")
+MODEL_PATH  = os.path.join(prefix, "model")
+PARAM_PATH  = os.path.join(prefix, "input/config/hyperparameters.json")
+OUTPUT_PATH = os.path.join(prefix, "output")
+
+
+def load_hyperparameters() -> dict:
+    if not os.path.exists(PARAM_PATH):
+        return {}
+    with open(PARAM_PATH) as f:
+        params = json.load(f)
+    return params
+
+
+def load_prep_data(monthly_file: str) -> pl.DataFrame:
+    path = os.path.join(INPUT_PATH, monthly_file)
+    return pl.read_parquet(path)
+
+
+def build_model(n_estimators=400, learning_rate=0.05, max_depth=9, random_state=42):
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CAT_COLS),
+            ("high_cat", TargetEncoder(smoothing=10), HIGH_CARD_COLS),
+            ("num", "passthrough", NUM_COLS),
+        ],
+        remainder="passthrough",
+    )
+    xgb_model = xgb.XGBRegressor(
+        objective="reg:tweedie",
+        tweedie_variance_power=1.3,
+        eval_metric="mae",
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        max_depth=max_depth,
+        min_child_weight=20,
+        gamma=1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.5,
+        reg_lambda=1.5,
+        random_state=random_state,
+    )
+    return Pipeline(steps=[("preprocessor", preprocessor), ("regressor", xgb_model)])
+
+
+def create_temporal_split(monthly_sales: pl.DataFrame, cutoff_date):
+    train_data = monthly_sales.filter(pl.col("year_month_date") <= cutoff_date)
+    test_data  = monthly_sales.filter(pl.col("year_month_date") > cutoff_date)
+    return train_data, test_data
+
+
+def prepare_xy(df: pl.DataFrame):
+    predictor = df.drop(["monthly_items", "year_month_date"]).to_pandas()
+    target    = df["monthly_items"].to_pandas()
+    return predictor, target
+
+
+def model_evaluation(clf_model, X_train, y_train, X_test, y_test) -> pd.DataFrame:
+    clf_model.fit(X_train, np.log1p(y_train))
+    y_pred = np.expm1(clf_model.predict(X_test))
+    return pd.DataFrame({
+        "metric": ["MAE", "RMSE", "MedAE", "R2"],
+        "value": [
+            mean_absolute_error(y_test, y_pred),
+            root_mean_squared_error(y_test, y_pred),
+            median_absolute_error(y_test, y_pred),
+            r2_score(y_test, y_pred),
+        ],
+    })
+
+
+def train_final(clf_model, monthly_sales: pl.DataFrame):
+    X, y = prepare_xy(monthly_sales)
+    clf_model.fit(X, np.log1p(y))
+    return clf_model
+
+
+def main():
+    print("Iniciando entrenamiento SageMaker")
+    start_time = time.time()
+
+    # Hiperparámetros
+    params        = load_hyperparameters()
+    n_estimators  = int(params.get("n_estimators", 400))
+    learning_rate = float(params.get("learning_rate", 0.05))
+    max_depth     = int(params.get("max_depth", 9))
+    random_state  = int(params.get("random_state", 42))
+    monthly_file  = params.get("monthly_file", "monthly_sales.parquet")
+
+    print(f"  n_estimators={n_estimators}, learning_rate={learning_rate}, max_depth={max_depth}")
+
+    monthly_sales = load_prep_data(monthly_file)
+    print(f"Datos cargados: {len(monthly_sales):,} registros")
+
+    clf_model = build_model(n_estimators, learning_rate, max_depth, random_state)
+
+    cutoff_date = pl.date(2015, 9, 1)
+    train_data, test_data = create_temporal_split(monthly_sales, cutoff_date)
+    X_train, y_train = prepare_xy(train_data)
+    X_test,  y_test  = prepare_xy(test_data)
+
+    metrics = model_evaluation(clf_model, X_train, y_train, X_test, y_test)
+    metrics_dict = dict(zip(metrics["metric"], metrics["value"]))
+    print(f"Métricas | RMSE: {metrics_dict['RMSE']:.4f} | MAE: {metrics_dict['MAE']:.4f} | R2: {metrics_dict['R2']:.4f}")
+
+    metrics.to_csv(os.path.join(MODEL_PATH, "holdout_metrics.csv"), index=False)
+
+    clf_model = train_final(clf_model, monthly_sales)
+
+    joblib.dump(clf_model, os.path.join(MODEL_PATH, "xgb_monthly_forecast_model.joblib"))
+
+    last_hist = monthly_sales.sort("year_month_date").group_by(["shop_id", "item_id"]).tail(1)
+    last_hist.write_parquet(os.path.join(MODEL_PATH, "last_hist.parquet"))
+
+    # Copiar catálogos auxiliares al MODEL_PATH para que predictor.py los encuentre
+    # durante el serving. SageMaker empaqueta todo /opt/ml/model/ en el artefacto.
+    import shutil
+    catalogs = [
+        "items_catalog.parquet",
+        "items_categories_catalog.parquet",
+        "shops_catalog.parquet",
+    ]
+    for catalog in catalogs:
+        src = os.path.join(INPUT_PATH, catalog)
+        dst = os.path.join(MODEL_PATH, catalog)
+        shutil.copy(src, dst)
+        print(f"Catálogo copiado: {catalog}")
+
+    elapsed = time.time() - start_time
+    print(f"Entrenamiento completo en {elapsed:.1f}s")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+        sys.exit(0)
+    except Exception as e:
+        with open(os.path.join(OUTPUT_PATH, "failure"), "w") as f:
+            f.write(str(e) + "\n" + traceback.format_exc())
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
