@@ -1,8 +1,13 @@
-#!/usr/bin/env python
 """
 Entrenamiento XGBoost para SageMaker BYOC.
 Lee datos de /opt/ml/input/data/training/
 Escribe modelo en /opt/ml/model/
+
+Fuente de datos (S3):
+  s3://1c-company-medallion/silver/monthly_sales/
+  s3://1c-company-medallion/silver/items_features/
+  s3://1c-company-medallion/silver/categories_features/
+  s3://1c-company-medallion/silver/shops_features/
 """
 
 import json
@@ -31,6 +36,13 @@ MODEL_PATH  = os.path.join(prefix, "model")
 PARAM_PATH  = os.path.join(prefix, "input/config/hyperparameters.json")
 OUTPUT_PATH = os.path.join(prefix, "output")
 
+# ── Nombres de archivo esperados ──────────────────
+# SageMaker descarga cada prefijo S3 de forma plana en INPUT_PATH.
+DEFAULT_MONTHLY_FILE    = "monthly_sales.parquet"
+DEFAULT_ITEMS_FILE      = "items_catalog.parquet"
+DEFAULT_CATEGORIES_FILE = "items_categories_catalog.parquet"
+DEFAULT_SHOPS_FILE      = "shops_catalog.parquet"
+
 
 def load_hyperparameters() -> dict:
     if not os.path.exists(PARAM_PATH):
@@ -48,9 +60,9 @@ def load_prep_data(monthly_file: str) -> pl.DataFrame:
 def build_model(n_estimators=400, learning_rate=0.05, max_depth=9, random_state=42):
     preprocessor = ColumnTransformer(
         transformers=[
-            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CAT_COLS),
-            ("high_cat", TargetEncoder(smoothing=10), HIGH_CARD_COLS),
-            ("num", "passthrough", NUM_COLS),
+            ("cat",      OneHotEncoder(handle_unknown="ignore", sparse_output=False), CAT_COLS),
+            ("high_cat", TargetEncoder(smoothing=10),                                 HIGH_CARD_COLS),
+            ("num",      "passthrough",                                               NUM_COLS),
         ],
         remainder="passthrough",
     )
@@ -108,19 +120,24 @@ def main():
     print("Iniciando entrenamiento SageMaker")
     start_time = time.time()
 
-    # Hiperparámetros
+    # ── Hiperparámetros ──────────────────────────────────────────────────────
     params        = load_hyperparameters()
     n_estimators  = int(params.get("n_estimators", 400))
     learning_rate = float(params.get("learning_rate", 0.05))
     max_depth     = int(params.get("max_depth", 9))
     random_state  = int(params.get("random_state", 42))
-    monthly_file  = params.get("monthly_file", "monthly_sales.parquet")
+    monthly_file  = params.get("monthly_file",    DEFAULT_MONTHLY_FILE)
+    items_file    = params.get("items_file",       DEFAULT_ITEMS_FILE)
+    categories_file = params.get("categories_file", DEFAULT_CATEGORIES_FILE)
+    shops_file    = params.get("shops_file",       DEFAULT_SHOPS_FILE)
 
     print(f"  n_estimators={n_estimators}, learning_rate={learning_rate}, max_depth={max_depth}")
 
+    # ── Carga de datos ───────────────────────────────────────────────────────
     monthly_sales = load_prep_data(monthly_file)
     print(f"Datos cargados: {len(monthly_sales):,} registros")
 
+    # ── Entrenamiento ────────────────────────────────────────────────────────
     clf_model = build_model(n_estimators, learning_rate, max_depth, random_state)
 
     cutoff_date = pl.date(2015, 9, 1)
@@ -132,28 +149,28 @@ def main():
     metrics_dict = dict(zip(metrics["metric"], metrics["value"]))
     print(f"Métricas | RMSE: {metrics_dict['RMSE']:.4f} | MAE: {metrics_dict['MAE']:.4f} | R2: {metrics_dict['R2']:.4f}")
 
+    # Guardar métricas para que predictor.py las use al calcular intervalos
     metrics.to_csv(os.path.join(MODEL_PATH, "holdout_metrics.csv"), index=False)
 
     clf_model = train_final(clf_model, monthly_sales)
-
     joblib.dump(clf_model, os.path.join(MODEL_PATH, "xgb_monthly_forecast_model.joblib"))
 
+    # Último historial por shop-item (usado en serving para features de lag)
     last_hist = monthly_sales.sort("year_month_date").group_by(["shop_id", "item_id"]).tail(1)
     last_hist.write_parquet(os.path.join(MODEL_PATH, "last_hist.parquet"))
 
-    # Copiar catálogos auxiliares al MODEL_PATH para que predictor.py los encuentre
-    # durante el serving. SageMaker empaqueta todo /opt/ml/model/ en el artefacto.
+    # ── Copiar catálogos auxiliares al artefacto del modelo ──────────────────
     import shutil
-    catalogs = [
-        "items_catalog.parquet",
-        "items_categories_catalog.parquet",
-        "shops_catalog.parquet",
-    ]
-    for catalog in catalogs:
-        src = os.path.join(INPUT_PATH, catalog)
-        dst = os.path.join(MODEL_PATH, catalog)
+    catalogs = {
+        items_file:      "items_catalog.parquet",
+        categories_file: "items_categories_catalog.parquet",
+        shops_file:      "shops_catalog.parquet",
+    }
+    for src_name, dst_name in catalogs.items():
+        src = os.path.join(INPUT_PATH, src_name)
+        dst = os.path.join(MODEL_PATH, dst_name)
         shutil.copy(src, dst)
-        print(f"Catálogo copiado: {catalog}")
+        print(f"Catálogo copiado: {src_name} → {dst_name}")
 
     elapsed = time.time() - start_time
     print(f"Entrenamiento completo en {elapsed:.1f}s")
@@ -168,3 +185,4 @@ if __name__ == "__main__":
             f.write(str(e) + "\n" + traceback.format_exc())
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
