@@ -12,6 +12,10 @@ SECRET_ID    = "x"
 RDS_REPLICA  = "x"
 REGION       = "us-east-1"
 
+# Endpoint SageMaker y datos de entrada
+SAGEMAKER_ENDPOINT = "demand-retail-endpoint"          # nombre del endpoint activo
+TEST_KEYS_BUCKET   = "1c-company-medallion"
+TEST_KEYS_KEY      = "bronze/test_keys/test_keys.csv"  # columnas: ID, shop_id, item_id
 
 # Crear Engine
 # ---------------------------------------------------------------------------
@@ -36,63 +40,85 @@ engine = build_engine()
 with engine.connect() as conn:
     conn.execute(text("SELECT 1"))
 
+# Helpers internos — SageMaker
+# ---------------------------------------------------------------------------
+def _load_test_keys() -> pd.DataFrame:
+    """
+    Descarga el test set desde S3.
+    Columnas esperadas: ID, shop_id, item_id
+    """
+    s3  = boto3.client("s3", region_name=REGION)
+    obj = s3.get_object(Bucket=TEST_KEYS_BUCKET, Key=TEST_KEYS_KEY)
+    return pd.read_csv(obj["Body"])
+ 
+ 
+def _invoke_endpoint(test_keys: pd.DataFrame) -> pd.DataFrame:
+    """
+    Envía el test set al endpoint SageMaker en lotes de 500 filas.
+    Devuelve un DataFrame con el schema completo de predicciones:
+      id, item_id, shop_id, category_id, region, date, created_at,
+      value, value_upper, value_lower
+    """
+    sm      = boto3.client("sagemaker-runtime", region_name=REGION)
+    results = []
+ 
+    for start in range(0, len(test_keys), 500):
+        batch = test_keys.iloc[start:start + 500]
+ 
+        buf = io.StringIO()
+        batch.to_csv(buf, index=False)
+ 
+        response = sm.invoke_endpoint(
+            EndpointName=SAGEMAKER_ENDPOINT,
+            ContentType="text/csv",
+            Body=buf.getvalue().encode("utf-8"),
+        )
+        chunk = pd.read_csv(io.StringIO(response["Body"].read().decode("utf-8")))
+        results.append(chunk)
+ 
+    return pd.concat(results, ignore_index=True)
 
 # Llamadas
 # ---------------------------------------------------------------------------
-def get_filter_options():
-    """Retorna las opciones únicas para los filtros de Tab 1"""
-    SQL = """
-    SELECT DISTINCT 
-        region_id AS regions,
-        shop_id AS shops,
-        category_id AS categories
-    FROM predictions;
+def get_filter_options() -> dict:
     """
-    with engine.connect() as conn:
-        row = conn.execute(text(SQL)).fetchone()
+    Retorna las opciones únicas de filtro a partir de las predicciones
+    obtenidas del endpoint. Compatible con el contrato original de la app.
+    """
+    df = _invoke_endpoint(_load_test_keys())
     return {
-        "regions": row.regions,
-        "shops": row.shops,
-        "categories": row.categories
+        "regions":    sorted(df["region"].dropna().unique().tolist()),
+        "shops":      sorted(df["shop_id"].dropna().unique().tolist()),
+        "categories": sorted(df["category_id"].dropna().unique().tolist()),
     }
-
-
-
-def get_predictions(region_ids=None, shop_ids=None, category_ids=None):
+ 
+ 
+def get_predictions(region_ids=None, shop_ids=None, category_ids=None) -> pd.DataFrame:
     """
-    Retorna predicciones filtrando opcionalmente por región, tienda y categoría.
-    Columnas: id, item_id, shop_id, category_id, region_id, date, created_at
+    Llama al endpoint SageMaker con el test set completo y aplica
+    los filtros opcionales de región, tienda y categoría en memoria.
+ 
+    Columnas devueltas:
+      id, item_id, shop_id, category_id, region, date, created_at,
+      value, value_upper, value_lower
     """
-    filters = {}
-    params = {}
-
+    df = _invoke_endpoint(_load_test_keys())
+ 
+    # Renombrar 'region' → 'region_id' para mantener compatibilidad con app.py
+    df = df.rename(columns={"region": "region_id", "created_at": "run_date"})
+ 
+    # Filtros opcionales
     if region_ids:
-        filters.append("region_id = ANY(:regions)")
-        params["regions"] = region_ids
-
+        df = df[df["region_id"].isin(region_ids)]
     if shop_ids:
-        filters.append("shop_id = ANY(:shops)")
-        params["shops"] = shop_ids
-    
+        df = df[df["shop_id"].isin(shop_ids)]
     if category_ids:
-        filters.append("category_id = ANY(:category)")
-        params["categories"] = category_ids
-    
-    where = ( "WHERE " + "AND ".join(filters)) if filters else ""
-
-    SQL = f"""
-    SELECT id, item_id, shop_id, category_id, region_id,
-        date, run_date, value, value_lower, value_upper
-    FROM predictions
-    {where}
-    ORDER BY date;
-    """
-    with engine.connect() as conn:
-        df = pd.read_sql(text(SQL), conn)
-    
-    df["date"] = pd.to_datetime(df["date"])
+        df = df[df["category_id"].isin(category_ids)]
+ 
+    df["date"]     = pd.to_datetime(df["date"])
     df["run_date"] = pd.to_datetime(df["run_date"])
-    return df
+ 
+    return df.sort_values("date").reset_index(drop=True)
 
 def get_model_evaluation():
     """

@@ -150,7 +150,7 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("Data updates every 5 min")
+    st.caption("Predictions served live from SageMaker endpoint")
 
 # Guardar filtros en session_state para Tab 3
 st.session_state["filters"] = {
@@ -161,7 +161,7 @@ st.session_state["filters"] = {
 
 # Cargar datos filtrados 
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=0)
 def load_predictions(regions, shops, categories):
     return get_predictions(
         region_ids=regions,
@@ -198,7 +198,7 @@ with tab1:
         st.warning("No data found for the selected filters.")
     else:
         # KPIs
-        total_units  = int(df_pred["value"].sum())        # ← ahora suma value
+        total_units  = int(df_pred["value"].sum())
         stores_count = df_pred["shop_id"].nunique()
         avg_mape     = df_eval["mape"].mean() if not df_eval.empty else 0
 
